@@ -1,0 +1,342 @@
+# Lattice — AWS ACK data plane for a Kubernetes API
+# Author: Olaleye Oyewunmi
+# Catalog type: Deployment
+# Technologies: Kubernetes, AWS ACK, Amazon RDS, Amazon S3, External Secrets, Gateway API
+#
+# Catalog description:
+# Lattice is infrastructure as design across Kubernetes and AWS operators you
+# already run. An API Deployment talks to an ACK-managed RDS instance and an
+# ACK-managed S3 bucket. An ACK IAM Role is bound to the API ServiceAccount
+# with IRSA. External Secrets copies the RDS password into the app namespace.
+# Gateway API is the only public edge. The point of this design is the
+# relationships: Kubernetes resources and cloud resources in one graph, which
+# is what Meshery is for and what a Terraform-only catalog cannot show.
+#
+# Caveats:
+# ACK controllers for RDS, S3, and IAM must be installed. Replace ACCOUNT_ID,
+# subnet IDs, security group IDs, and the DB subnet group. The RDS instance
+# class here is demo-sized (db.t3.medium). Do not publish subnet IDs from a
+# real account — the placeholders are intentional.
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lattice
+  labels:
+    lattice.io/plane: app
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lattice-aws
+  labels:
+    lattice.io/plane: aws
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: payments-api
+  namespace: lattice
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/lattice-payments-api
+
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: Role
+metadata:
+  name: lattice-payments-api
+  namespace: lattice-aws
+spec:
+  name: lattice-payments-api
+  description: IRSA role for the Lattice payments API
+  assumeRolePolicyDocument: |
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Principal": {
+            "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE"
+          },
+          "Action": "sts:AssumeRoleWithWebIdentity",
+          "Condition": {
+            "StringEquals": {
+              "oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE:sub": "system:serviceaccount:lattice:payments-api"
+            }
+          }
+        }
+      ]
+    }
+  policies:
+    - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: Policy
+metadata:
+  name: lattice-payments-s3-write
+  namespace: lattice-aws
+spec:
+  name: lattice-payments-s3-write
+  description: Write receipts to the Lattice S3 bucket
+  policyDocument: |
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+          "Resource": "arn:aws:s3:::lattice-payments-receipts/*"
+        }
+      ]
+    }
+
+---
+apiVersion: rds.services.k8s.aws/v1alpha1
+kind: DBSubnetGroup
+metadata:
+  name: lattice-data
+  namespace: lattice-aws
+spec:
+  name: lattice-data
+  description: Lattice private subnets for RDS
+  subnetIDs:
+    - subnet-PLACEHOLDER-a
+    - subnet-PLACEHOLDER-b
+    - subnet-PLACEHOLDER-c
+  tags:
+    - key: design
+      value: lattice
+---
+apiVersion: rds.services.k8s.aws/v1alpha1
+kind: DBInstance
+metadata:
+  name: lattice-payments
+  namespace: lattice-aws
+spec:
+  dbInstanceIdentifier: lattice-payments
+  engine: postgres
+  engineVersion: "16.4"
+  dbInstanceClass: db.t3.medium
+  allocatedStorage: 50
+  storageType: gp3
+  storageEncrypted: true
+  dbSubnetGroupName: lattice-data
+  vpcSecurityGroupIDs:
+    - sg-PLACEHOLDER
+  masterUsername: lattice
+  masterUserPassword:
+    namespace: lattice
+    name: lattice-rds-master
+    key: password
+  dbName: payments
+  backupRetentionPeriod: 7
+  deletionProtection: true
+  publiclyAccessible: false
+  tags:
+    - key: design
+      value: lattice
+
+---
+apiVersion: s3.services.k8s.aws/v1alpha1
+kind: Bucket
+metadata:
+  name: lattice-payments-receipts
+  namespace: lattice-aws
+spec:
+  name: lattice-payments-receipts
+  versioning:
+    status: Enabled
+  encryption:
+    rules:
+      - applyServerSideEncryptionByDefault:
+          sseAlgorithm: aws:kms
+  publicAccessBlock:
+    blockPublicAcls: true
+    blockPublicPolicy: true
+    ignorePublicAcls: true
+    restrictPublicBuckets: true
+  tagging:
+    tagSet:
+      - key: design
+        value: lattice
+
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: payments-api
+  namespace: lattice
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: payments-api
+  data:
+    - secretKey: DATABASE_URL
+      remoteRef:
+        key: lattice/payments-api
+        property: database_url
+    - secretKey: S3_BUCKET
+      remoteRef:
+        key: lattice/payments-api
+        property: s3_bucket
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments-api
+  namespace: lattice
+  labels:
+    app.kubernetes.io/name: payments-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payments-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: payments-api
+    spec:
+      serviceAccountName: payments-api
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: ghcr.io/example/payments-api:2.1.0
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: payments-api
+                  key: DATABASE_URL
+            - name: S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: payments-api
+                  key: S3_BUCKET
+            - name: AWS_REGION
+              value: us-east-1
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments-api
+  namespace: lattice
+spec:
+  selector:
+    app.kubernetes.io/name: payments-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: lattice
+  namespace: lattice
+spec:
+  gatewayClassName: envoy
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: payments.lattice.example
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: lattice-tls
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: payments-api
+  namespace: lattice
+spec:
+  parentRefs:
+    - name: lattice
+  hostnames:
+    - payments.lattice.example
+  rules:
+    - backendRefs:
+        - name: payments-api
+          port: 8080
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: lattice
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gateway-and-rds
+  namespace: lattice
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: payments-api
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              gateway.networking.k8s.io/gateway-name: lattice
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 443
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payments-api
+  namespace: lattice
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payments-api
